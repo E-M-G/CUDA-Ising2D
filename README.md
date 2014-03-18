@@ -1,4 +1,4 @@
 CUDA-Ising2D
 ============
 
---Work in progress-- 
+---Work in progress---
