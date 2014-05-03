@@ -1,31 +1,60 @@
+#include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <vector>
 
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <thrust/device_free.h>
 #include <thrust/transform.h>
 
 const int J = 1.0;
 const double K_b =1.0; //actual value : 1.3806503 x 10^(-23)
-double T = 7.0;
+double T = 1.6;
 const double finalTemp = 1.5;
 const double tempStep = 0.1;
 
-const int MCSTEPS = 100000000;
+const int MCSTEPS = 1000000;
+int numOfBins = 10;
+int binSize = MCSTEPS/numOfBins;
 
 const int num_elements_x = 128; //MUST BE MXM matrix, 2^n and no greater than 512*512
 const int num_elements_y = 128;
 const int MAXLENGTH = num_elements_x*num_elements_y;
-const int BLOCKSIZE = num_elements_x/4;
+const int BLOCKSIZE = num_elements_x/16;   ///CANNOT EXCEED 32*32 = 1024 theards  for 1024x1024 used num_elements_x/32
 
-__device__ int stateArray[MAXLENGTH];
+
 
 
 //nvcc  -arch=sm_20 -o Ising2d Ising2d.cu
 
+using namespace std;
 
-__device__ int calcStatesEnergy (int *array){
+thrust::host_vector<float> energyPerStepBin;
+thrust::host_vector<float> avgEnergyPerStepBin; 
+
+thrust::host_vector<float> eneSquaredBin;
+thrust::host_vector<float> avgEneSquaredBin;
+
+
+thrust::host_vector<float> magnetizationPerStepBin; 
+thrust::host_vector<float> avgMagnetizationPerStepBin;
+
+thrust::host_vector<float> magSquaredBin;
+thrust::host_vector<float> avgMagSquaredBin;
+
+//MEASUREMENTS
+vector<float> tempValues;
+vector<float> energyMeasurements;
+vector<float> eneSquaredMeasurements;
+vector<float> magnetizationMeasurements;
+vector<float> magSquaredMeasurements;
+
+vector<float>magSuscept;
+vector<float>specficHeat;
+
+
+__device__ int calcStatesEnergy (float *array){
   int index_x = blockIdx.x * blockDim.x + threadIdx.x;
   int index_y = blockIdx.y * blockDim.y + threadIdx.y;
   int grid_width = gridDim.x * blockDim.x;
@@ -67,7 +96,7 @@ __device__ int calcStatesEnergy (int *array){
 
 
 
-__global__ void getSitesEnegry(int *input)
+__global__ void getSitesEnegry(float *input)
 {
   int index_x = blockIdx.x * blockDim.x + threadIdx.x;
   int index_y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -83,74 +112,13 @@ __global__ void getSitesEnegry(int *input)
 
 }
 
-/*
-template<unsigned int blockSize>
-__global__ void reduce(int *g_idata, float *g_odata, unsigned int n)
-{
-    extern __shared__ float sdata[];
-
-    // perform first level of reduction,
-    // reading from global memory, writing to shared memory
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x*blockDim.x*2 + threadIdx.x;
-    unsigned int gridSize = blockDim.x*2*gridDim.x;
-
-    sdata[tid] = 0;
 
 
-    // we reduce multiple elements per thread.  The number is determined by the
-    // number of active thread blocks (via gridDim).  More blocks will result
-    // in a larger gridSize and therefore fewer elements per thread
-    while (i < n)
-    {
-        sdata[tid] += g_idata[i] +g_idata[i + blockSize];
-        i+= gridSize;
-    }
-    __syncthreads();
+float getStatesEnegry(thrust::device_vector<float> device_vector) {
 
 
-    // do reduction in shared mem
-    if (blockSize >= 512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
-    if (blockSize >= 256) { if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads(); }
-    if (blockSize >= 128) { if (tid <  64) { sdata[tid] += sdata[tid +  64]; } __syncthreads(); }
 
-    if (tid < 32)
-    {
-        // now that we are using warp-synchronous programming (below)
-        // we need to declare our shared memory volatile so that the compiler
-        // doesn't reorder stores to it and induce incorrect behavior.
-        
-        if (blockDim.x >=  64) { sdata[tid] += sdata[tid + 32]; }
-        if (blockDim.x >=  32) { sdata[tid] += sdata[tid + 16]; }
-        if (blockDim.x >=  16) { sdata[tid] += sdata[tid +  8]; }
-        if (blockDim.x >=   8) { sdata[tid] += sdata[tid +  4]; }
-        if (blockDim.x >=   4) { sdata[tid] += sdata[tid +  2]; }
-        if (blockDim.x >=   2) { sdata[tid] += sdata[tid +  1]; }
-    }
-
-    // write result for this block to global mem
-    if (tid == 0)
-        g_odata[blockIdx.x] = sdata[0];
-}
-*/
-
-float getStatesEnegry(int* host_array) {
-
-  int num_bytes = num_elements_x * num_elements_y * sizeof(int);
-
-  int num_bytes2 = num_elements_x * num_elements_y * sizeof(float);
-
-  int *device_array = 0;
-
-
-  // allocate memory in either space
-  cudaMalloc((void**)&device_array, num_bytes);
-
-  float *d_sum_array;
-  float *h_sum_array;
-
-  h_sum_array = (float*)malloc(num_bytes2);
-  cudaMalloc((void**)&d_sum_array, num_bytes2);
+  float* raw_ptr = thrust::raw_pointer_cast(device_vector.data());
 
   
   // create two dimensional 4x4 thread blocks
@@ -163,35 +131,21 @@ float getStatesEnegry(int* host_array) {
   grid_size.x = num_elements_x / block_size.x;
   grid_size.y = num_elements_y / block_size.y;
 
-  // copy array to device
-  cudaMemcpy(device_array ,host_array , num_bytes, cudaMemcpyHostToDevice);
+  cudaThreadSynchronize();
+
 
   // grid_size & block_size are passed as arguments to the triple chevrons as usual
-  getSitesEnegry<<<grid_size,block_size>>>(device_array);
-
-
-  cudaFree(device_array);
-
-  // copy array to device
-  cudaMemcpy(device_array ,host_array , num_bytes, cudaMemcpyHostToDevice);
-
-
-
-  //reduce< BLOCKSIZE > <<< 1 ,block_size, num_bytes2 >>>(device_array, d_sum_array, MAXLENGTH);
-
-  //cudaMemcpy(h_sum_array, d_sum_array, num_bytes2, cudaMemcpyDeviceToHost);
-
-  //printf("the sum is : %f\n", h_sum_array[0]);
+  getSitesEnegry<<<grid_size,block_size>>>(raw_ptr);
 
   
 
-  //cudaFree(d_sum_array);   
- 
 
-  thrust::device_ptr<int> dev_ptr(device_array);
+  thrust::device_ptr<float> dev_ptr = thrust::device_pointer_cast(raw_ptr);
   float sum = thrust::reduce(dev_ptr, dev_ptr + MAXLENGTH);
 
-  cudaFree(device_array);
+  //thrust::device_free(dev_ptr);
+  //cudaFree(raw_ptr);
+  
   //return h_sum_array[0]/float(MAXLENGTH);
 
   return sum/MAXLENGTH;
@@ -201,36 +155,22 @@ float getStatesMag(int* host_array) {
 
   int num_bytes = num_elements_x * num_elements_y * sizeof(int);
 
-  int num_bytes2 = num_elements_x * num_elements_y * sizeof(float);
+  //int num_bytes2 = num_elements_x * num_elements_y * sizeof(float);
 
   int *device_array;
 
 
   // allocate memory in either space
-  cudaMalloc((void**)&device_array, num_bytes2);
-
-  float *d_sum_array;
-  float *h_sum_array;
-
-  h_sum_array = (float*)malloc(num_bytes2);
-  cudaMalloc((void**)&d_sum_array, num_bytes2);
-
+  cudaMalloc((void**)&device_array, num_bytes);
   // copy array to device
   cudaMemcpy(device_array ,host_array , num_bytes, cudaMemcpyHostToDevice);
-
-  //dim3 block_size;
-  //block_size.x = BLOCKSIZE;
- // block_size.y = BLOCKSIZE;
-
-  //reduce< BLOCKSIZE > <<< 1 ,block_size, num_bytes2 >>>(device_array, d_sum_array, MAXLENGTH);
-
-  //cudaMemcpy(h_sum_array, d_sum_array, num_bytes2, cudaMemcpyDeviceToHost);
 
   thrust::device_ptr<int> dev_ptr(device_array);
   float sum = thrust::reduce(dev_ptr, dev_ptr + MAXLENGTH);
 
-  cudaFree(d_sum_array);   
+    
   cudaFree(device_array);
+  cudaDeviceReset();
 
   //return  h_sum_array[0]/float(MAXLENGTH);
   return sum/MAXLENGTH;
@@ -238,18 +178,19 @@ float getStatesMag(int* host_array) {
 
 
 
-void printState(int* host_array){
+void printState(thrust::device_vector<float> host_array){
     double sum = 0;
   for(int row = 0; row < num_elements_y; ++row)
   {
     for(int col = 0; col < num_elements_x; ++col)
     {
       sum = sum + host_array[row*num_elements_x +col];
+      int element = host_array[row * num_elements_x + col];
       if(host_array[row*num_elements_x +col] == -1 ){
-          printf("\033[1;31m %2d \033[0m", host_array[row * num_elements_x + col]);
+          printf("\033[1;31m %2d \033[0m",  element);
         }
         else{
-          printf("\033[1;36m %2d \033[0m", host_array[row * num_elements_x + col]);
+          printf("\033[1;36m %2d \033[0m", element);
         }
 
     }
@@ -259,37 +200,37 @@ void printState(int* host_array){
 }
 
 
-float getChangeEnergy(int* host_array, int i , int j){
+float getChangeEnergy(thrust::device_vector<float> device_vector, int i , int j){
   
   int m = num_elements_x - 1;
-  int s = host_array[i*num_elements_x + j];
+  int s = device_vector[i*num_elements_x + j];
 
   int neighbors, top, bottom, left, right; 
   
   //testing if on top/bottom edge. 
   if ( (i - 1) < 0 ){
-    top = host_array[m*num_elements_x + j]; 
+    top = device_vector[m*num_elements_x + j]; 
   }else{
-    top = host_array[(i-1)*num_elements_x + j];
+    top = device_vector[(i-1)*num_elements_x + j];
   };
 
   if ( (i + 1) > m){
-    bottom = host_array[ j ];
+    bottom = device_vector[ j ];
   }else{
-    bottom = host_array[(i+1)*num_elements_x + j];
+    bottom = device_vector[(i+1)*num_elements_x + j];
   };
 
   //testing if on right/left edge. 
   if ( (j - 1) < 0 ){
-    left = host_array[i*num_elements_x + m]; 
+    left = device_vector[i*num_elements_x + m]; 
   }else{
-    left = host_array[i*num_elements_x + (j-1)];
+    left = device_vector[i*num_elements_x + (j-1)];
   };
 
   if ( (j + 1) > m){
-    right = host_array[i*num_elements_x ];
+    right = device_vector[i*num_elements_x ];
   }else{
-    right = host_array[i*num_elements_x + (j+1)];
+    right = device_vector[i*num_elements_x + (j+1)];
   };
 
   neighbors = right+left+top+bottom;
@@ -302,7 +243,7 @@ float getChangeEnergy(int* host_array, int i , int j){
 }
 
 
-void warmUpSweep(int *host_array, int maxHeatingStep){
+void warmUpSweep(thrust::device_vector<float> device_vector, int maxHeatingStep){
 
      for(int step = 0 ; step < maxHeatingStep ; step++ ){
      
@@ -316,7 +257,7 @@ void warmUpSweep(int *host_array, int maxHeatingStep){
       */
 
 
-      double delta_E = getChangeEnergy(host_array, i , j);
+      double delta_E = getChangeEnergy(device_vector, i , j);
       double boltzman = exp((-1.0*delta_E)/(K_b*T));
 
       //printf("delta E : %f  boltzman : %f\n", delta_E, boltzman);
@@ -324,8 +265,8 @@ void warmUpSweep(int *host_array, int maxHeatingStep){
 
       if(delta_E <= 0.0){
 
-        host_array[i*num_elements_x + j] = -1*host_array[i*num_elements_x + j];  //flip spin
-        //printf("the enegry at step %d is  : %f\n",maxHeatingStep,getStatesEnegry(host_array));
+        device_vector[i*num_elements_x + j] = -1*device_vector[i*num_elements_x + j];  //flip spin
+        //printf("the enegry at step %d is  : %f\n",maxHeatingStep,getStatesEnegry(device_vector));
 
       }else{
 
@@ -333,20 +274,121 @@ void warmUpSweep(int *host_array, int maxHeatingStep){
 
           if(n <= boltzman){
 
-            host_array[i*num_elements_x + j] = -1*host_array[i*num_elements_x + j];  //flip spin
-            //printf("the enegry at step %d is  : %f\n",step,getStatesEnegry(host_array));
+            device_vector[i*num_elements_x + j] = -1*device_vector[i*num_elements_x + j];  //flip spin
+            //printf("the enegry at step %d is  : %f\n",step,getStatesEnegry(device_vector));
 
         }
       } 
-    //printf("the mag at step %d is  : %f\n",step,getStatesMag(host_array));
+    //printf("the mag at step %d is  : %f\n",step,getStatesMag(device_vector));
     
   }
-  printState(host_array);
-  printf("__________________________________________________________\n");
-  printf("the enegry is  : %f\n",getStatesEnegry(host_array));
-  printf("__________________________________________________________\n");
-  printf("the mag is  : %f\n",getStatesMag(host_array));
-  printf("\n");
+
+  
+}
+
+
+void monteCarloSweep(thrust::device_vector<float> device_vector, int MCSTEPS){
+
+      clock_t start, end;
+
+      start = clock();
+      float E;
+     for(int step = 0 ; step < MCSTEPS ; step++ ){
+     
+      int i = rand()%num_elements_x;
+      int j = rand()%num_elements_y;
+      
+      /*
+      printf("i %d , j %d ", i ,j);
+      int test = i*num_elements_y +j;
+      printf(" %d \n",test);   
+      */
+
+      
+      double delta_E = getChangeEnergy(device_vector, i , j);
+      double boltzman = exp((-1.0*delta_E)/(K_b*T));
+
+      //printf("delta E : %f  boltzman : %f\n", delta_E, boltzman);
+
+
+      if(delta_E <= 0.0){
+
+        device_vector[i*num_elements_x + j] = -1*device_vector[i*num_elements_x + j];  //flip spin
+        
+        E = getStatesEnegry(device_vector);
+        //energyPerStepBin.push_back(E);
+        //printf("the enegry at step %d is  : %f\n",step,E);
+
+      }else{
+
+          double n =((double)rand()/(double)RAND_MAX);  //some voodoo to make random double between 0 to 1
+
+          if(n <= boltzman){
+
+            device_vector[i*num_elements_x + j] = -1*device_vector[i*num_elements_x + j];  //flip spin
+            E = getStatesEnegry(device_vector);
+            //energyPerStepBin.push_back(E);
+            //printf("the enegry at step %d is  : %f\n",step,E);
+
+        }else{
+
+            E = getStatesEnegry(device_vector);
+            //energyPerStepBin.push_back(E);
+            //printf("the enegry at step %d is  : %f\n",step,E);
+
+         }
+
+      } 
+    //printf("the mag at step %d is  : %f\n",step,getStatesMag(device_vector));
+      /*
+      while( energyPerStepBin.size() == binSize ){
+        
+        thrust::device_vector<float> D = energyPerStepBin;
+        float E = thrust::reduce(D.begin(),D.end())/binSize;
+        D.clear();
+        D.shrink_to_fit();
+        printf("the E is : %f\n",E);
+        avgEnergyPerStepBin.push_back(E);
+
+        //double E2 = average(eneSquaredBin);
+        //avgEneSquaredBin.push_back(E2);
+
+        //double M = average(magnetizationPerStepBin);
+        //avgMagnetizationPerStepBin.push_back(M);
+
+        //double M2 = average(magSquaredBin);
+        //avgMagSquaredBin.push_back(M);
+
+        energyPerStepBin.clear();
+        energyPerStepBin.shrink_to_fit();
+        //eneSquaredBin.clear();
+        //magnetizationPerStepBin.clear();
+        //magSquaredBin.clear();
+    
+      } 
+    */
+    
+  }
+  printf("the enegry  is  : %f\n",E);
+  printState(device_vector);
+  /*
+  tempValues.push_back(T);
+
+  thrust::device_vector<float> D = avgEnergyPerStepBin;
+  float E = thrust::reduce(D.begin(),D.end())/avgEnergyPerStepBin.size();
+  energyMeasurements.push_back(E);
+  printf("the sweeps final E is : %f\n",E);
+  D.clear();
+  D.shrink_to_fit();
+
+  end = clock();
+  std::cout <<" +++++++++ MONTE CARLO FINISH at Temp : " << T << " +++++++++++++++ "<< std::endl;
+  std::cout <<std::endl;
+  std::cout<<" < E > : "<< energyMeasurements[energyMeasurements.size()-1] <<std::endl;
+  */
+  end = clock();
+
+  std::cout<<" Total MCSweep Runtime: "<< double((end - start)) / double(CLOCKS_PER_SEC)<<"s"<<std::endl; 
   
 }
 
@@ -356,17 +398,18 @@ void warmUpSweep(int *host_array, int maxHeatingStep){
 
 int main(void){
 
-  int num_bytes = num_elements_x * num_elements_y * sizeof(int);
-  int *host_array = 0;
+  //int num_bytes = num_elements_x * num_elements_y * sizeof(float);
+  //float *host_array = 0;
 
+  thrust::host_vector<float> host_array(MAXLENGTH);
   // allocate memory in either space
-  host_array = (int*)malloc(num_bytes);
+  //host_array = (float*)malloc(num_bytes);
 
   for( int i = 0; i < MAXLENGTH; i++ ) {
-     host_array[i] = (rand() % 2) * 2 - 1;
+    host_array[i] = (rand() % 2) * 2 - 1;
   }
 
- 
+ thrust::device_vector<float> device_vector = host_array;
 
   //printState(host_array);
 
@@ -375,8 +418,8 @@ int main(void){
   printf("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n");
   printf("the temp is : %f\n",T);
 
-  warmUpSweep(host_array,MCSTEPS);
-
+  warmUpSweep(device_vector,MCSTEPS/100);
+  monteCarloSweep(device_vector,MCSTEPS);
   //printState(host_array); 
 
 
@@ -384,7 +427,5 @@ int main(void){
 
   }
 
-   printf("the final enegry at Temp %f is  : %f\n",T,getStatesEnegry(host_array));
-   printf("the final mag is     : %f\n",getStatesMag(host_array));
 
 }
